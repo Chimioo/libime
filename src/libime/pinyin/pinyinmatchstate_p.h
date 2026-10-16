@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -25,7 +26,7 @@
 
 namespace libime {
 
-using PinyinTriePosition = std::pair<uint64_t, size_t>;
+using PinyinTriePosition = std::tuple<uint64_t, size_t, bool>;
 using PinyinTriePositions = std::vector<PinyinTriePosition>;
 
 // Matching result for a specific PinyinTrie.

@@ -68,6 +68,18 @@ enum class PinyinFuzzyFlag {
      * Enable matching for lower case single pinyin as English letter.
      */
     Letter = 1 << 21,
+    /**
+     * Smart keyboard correction for close neighbors (low penalty).
+     *
+     * @since 1.1.18
+     */
+    SmartCorrection = 1 << 22,
+    /**
+     * Smart keyboard correction for far neighbors (medium penalty).
+     *
+     * @since 1.1.18
+     */
+    SmartCorrectionFar = 1 << 23,
 };
 
 using PinyinFuzzyFlags = fcitx::Flags<PinyinFuzzyFlag>;

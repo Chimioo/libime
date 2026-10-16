@@ -63,7 +63,10 @@ PinyinMatchState::shuangpinProfile() const {
 std::shared_ptr<const PinyinCorrectionProfile>
 PinyinMatchState::correctionProfile() const {
     FCITX_D();
-    if (d->context_->ime()->fuzzyFlags().test(PinyinFuzzyFlag::Correction)) {
+    if (d->context_->ime()->fuzzyFlags().testAny(
+            PinyinFuzzyFlags{PinyinFuzzyFlag::Correction,
+                            PinyinFuzzyFlag::SmartCorrection,
+                            PinyinFuzzyFlag::SmartCorrectionFar})) {
         return d->context_->ime()->correctionProfile();
     }
     return {};

@@ -25,6 +25,15 @@ enum class BuiltinPinyinCorrectionProfile {
      * Pinyin correction based on qwerty keyboard
      */
     Qwerty,
+    /**
+     * Smart correction based on 2D QWERTY geometry with tiered penalties.
+     *
+     * Close neighbors use a small penalty so strong language-model
+     * candidates can still win.
+     *
+     * @since 1.1.18
+     */
+    SmartQwerty,
 };
 
 class PinyinCorrectionProfilePrivate;
@@ -59,7 +68,10 @@ public:
     /**
      * Return the updated pinyin map
      *
-     * New entries will be marked with PinyinFuzzyFlag::Correction
+     * New entries will be marked with PinyinFuzzyFlag::Correction for custom
+     * mappings, or PinyinFuzzyFlag::SmartCorrection /
+     * PinyinFuzzyFlag::SmartCorrectionFar for the built-in Qwerty profile
+     * (2D keyboard geometry with tiered penalties).
      *
      * @see getPinyinMapV2
      */

@@ -218,6 +218,14 @@ size_t fuzzyFactor(PinyinFuzzyFlags flags) {
         flags = flags.unset(PinyinFuzzyFlag::Correction);
         factor += PINYIN_CORRECTION_FUZZY_FACTOR;
     }
+    if (flags.test(PinyinFuzzyFlag::SmartCorrection)) {
+        flags = flags.unset(PinyinFuzzyFlag::SmartCorrection);
+        factor += PINYIN_SMART_CORRECTION_CLOSE_FACTOR;
+    }
+    if (flags.test(PinyinFuzzyFlag::SmartCorrectionFar)) {
+        flags = flags.unset(PinyinFuzzyFlag::SmartCorrectionFar);
+        factor += PINYIN_SMART_CORRECTION_FAR_FACTOR;
+    }
     if (flags.test(PinyinFuzzyFlag::AdvancedTypo)) {
         flags = flags.unset(PinyinFuzzyFlag::AdvancedTypo);
         factor += PINYIN_ADVACNED_TYPO_FUZZY_FACTOR;
@@ -226,6 +234,12 @@ size_t fuzzyFactor(PinyinFuzzyFlags flags) {
         factor += 1;
     }
     return factor;
+}
+
+bool isCorrectionFlags(PinyinFuzzyFlags flags) {
+    return flags.test(PinyinFuzzyFlag::Correction) ||
+           flags.test(PinyinFuzzyFlag::SmartCorrection) ||
+           flags.test(PinyinFuzzyFlag::SmartCorrectionFar);
 }
 
 PinyinDictionary::TrieType loadTextImpl(std::istream &in) {
@@ -390,7 +404,7 @@ void PinyinDictionaryPrivate::addEmptyMatch(
             }
             const auto &trie = *q->trie(i);
             currentMatches.emplace_back(&trie, 0, vec, flags_[i]);
-            currentMatches.back().triePositions().emplace_back(0, 0);
+            currentMatches.back().triePositions().emplace_back(0, 0, false);
         }
     }
 }
@@ -402,7 +416,8 @@ PinyinTriePositions traverseAlongPathOneStepBySyllables(
     for (const auto &pr : path.triePositions()) {
         uint64_t _pos;
         size_t fuzzies;
-        std::tie(_pos, fuzzies) = pr;
+        bool isCorrectionSoFar;
+        std::tie(_pos, fuzzies, isCorrectionSoFar) = pr;
         for (const auto &syl : syls) {
             // make a copy
             auto pos = _pos;
@@ -413,25 +428,38 @@ PinyinTriePositions traverseAlongPathOneStepBySyllables(
             }
             const auto &finals = syl.second;
 
-            auto updateNext = [fuzzies, &path, &positions](PinyinFinal pyFinal,
-                                                           size_t fuzzyFactor,
-                                                           auto pos) {
+            auto updateNext = [fuzzies, isCorrectionSoFar, &path,
+                               &positions](PinyinFinal pyFinal,
+                                           PinyinFuzzyFlags flags, auto pos) {
                 auto final = static_cast<char>(pyFinal);
                 const auto resultRaw = path.trie()->traverseRaw(&final, 1, pos);
 
                 if (!PinyinTrie::isNoPathRaw(resultRaw)) {
-                    size_t newFuzzies = fuzzies + fuzzyFactor;
-                    positions.emplace_back(pos, newFuzzies);
+                    size_t newFuzzies = fuzzies + fuzzyFactor(flags);
+                    bool newIsCorrection =
+                        isCorrectionSoFar || isCorrectionFlags(flags);
+                    positions.emplace_back(pos, newFuzzies, newIsCorrection);
                 }
             };
             if (finals.size() > 1 || finals[0].first != PinyinFinal::Invalid) {
                 for (auto final : finals) {
-                    updateNext(final.first, fuzzyFactor(final.second), pos);
+                    updateNext(final.first, final.second, pos);
                 }
             } else if (!path.flags_.test(PinyinDictFlag::FullMatch)) {
+                // Bare initial matching any final (incomplete syllable).
+                // Keep legacy cost of +1 and propagate correction flag
+                // unchanged (this branch itself is not a correction).
                 for (char test = PinyinEncoder::firstFinal;
                      test <= PinyinEncoder::lastFinal; test++) {
-                    updateNext(static_cast<PinyinFinal>(test), 1, pos);
+                    auto finalChar =
+                        static_cast<char>(static_cast<PinyinFinal>(test));
+                    auto posCopy = pos;
+                    const auto resultRaw =
+                        path.trie()->traverseRaw(&finalChar, 1, posCopy);
+                    if (!PinyinTrie::isNoPathRaw(resultRaw)) {
+                        positions.emplace_back(posCopy, fuzzies + 1,
+                                               isCorrectionSoFar);
+                    }
                 }
             }
         }
@@ -445,12 +473,9 @@ void matchWordsOnTrie(const PinyinTrie *userDict, const MatchedPinyinPath &path,
     for (const auto &pr : path.triePositions()) {
         uint64_t pos;
         size_t fuzzies;
-        std::tie(pos, fuzzies) = pr;
+        bool isCorrection;
+        std::tie(pos, fuzzies, isCorrection) = pr;
         const float extraCost = fuzzies * fuzzyCost;
-        // This is an inaccuration estimation, since fuzzies may contain real
-        // fuzzy pinyin. But since this value is 10, it is a good estimate.
-        // After all 10 fuzzies in a word is kinda impossible.
-        const bool isCorrection = fuzzies >= PINYIN_CORRECTION_FUZZY_FACTOR;
         if (matchLongWord) {
             path.trie()->foreach(
                 [userDict, &path, &callback, extraCost, isCorrection](

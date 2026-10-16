@@ -152,6 +152,8 @@ LongestMatchResult longestMatch(Iter iter, Iter end, PinyinFuzzyFlags flags,
                                 const PinyinMap &map) {
     if ((*iter == 'i' || *iter == 'u' || *iter == 'v') &&
         !flags.testAny(PinyinFuzzyFlags{PinyinFuzzyFlag::Correction,
+                                        PinyinFuzzyFlag::SmartCorrection,
+                                        PinyinFuzzyFlag::SmartCorrectionFar,
                                         PinyinFuzzyFlag::Letter})) {
         return {.valid = false,
                 .match = std::string_view(&*iter, std::distance(iter, end)),
@@ -202,15 +204,28 @@ PinyinEncoder::parseUserPinyin(std::string userPinyin,
     const auto end = pinyin.end();
 
     if (!profile) {
-        flags = flags.unset(PinyinFuzzyFlag::Correction);
+        flags = flags.unset(PinyinFuzzyFlag::Correction)
+                    .unset(PinyinFuzzyFlag::SmartCorrection)
+                    .unset(PinyinFuzzyFlag::SmartCorrectionFar);
+    } else if (flags.test(PinyinFuzzyFlag::Correction)) {
+        // Old configs only enable Correction. Smart entries use separate
+        // flags, enable them together to avoid config migration.
+        flags |= PinyinFuzzyFlags{PinyinFuzzyFlag::SmartCorrection,
+                                 PinyinFuzzyFlag::SmartCorrectionFar};
     }
     std::vector<PinyinFuzzyFlags> flagsToTry = {flags};
-    if (flags.test(PinyinFuzzyFlag::Correction)) {
-        flagsToTry.push_back(flags.unset(PinyinFuzzyFlag::Correction));
+    if (flags.testAny(PinyinFuzzyFlags{PinyinFuzzyFlag::Correction,
+                                       PinyinFuzzyFlag::SmartCorrection,
+                                       PinyinFuzzyFlag::SmartCorrectionFar})) {
+        flagsToTry.push_back(flags.unset(PinyinFuzzyFlag::Correction)
+                                 .unset(PinyinFuzzyFlag::SmartCorrection)
+                                 .unset(PinyinFuzzyFlag::SmartCorrectionFar));
     }
     if (flags.test(PinyinFuzzyFlag::AdvancedTypo)) {
         flagsToTry.push_back(flags.unset(PinyinFuzzyFlag::AdvancedTypo)
-                                 .unset(PinyinFuzzyFlag::Correction));
+                                 .unset(PinyinFuzzyFlag::Correction)
+                                 .unset(PinyinFuzzyFlag::SmartCorrection)
+                                 .unset(PinyinFuzzyFlag::SmartCorrectionFar));
     }
 
     const auto &pinyinMap = profile ? profile->pinyinMap() : getPinyinMapV2();
@@ -836,6 +851,14 @@ PinyinEncoder::stringToSyllablesWithFuzzyFlags(
     std::string_view pinyinView, const PinyinCorrectionProfile *profile,
     PinyinFuzzyFlags flags) {
     auto identity = [](const PinyinFuzzyFlags &flags) { return flags; };
+    if (profile && flags.test(PinyinFuzzyFlag::Correction)) {
+        flags |= PinyinFuzzyFlags{PinyinFuzzyFlag::SmartCorrection,
+                                 PinyinFuzzyFlag::SmartCorrectionFar};
+    }
+    if (!profile) {
+        flags = flags.unset(PinyinFuzzyFlag::SmartCorrection)
+                    .unset(PinyinFuzzyFlag::SmartCorrectionFar);
+    }
     return stringToSyllablesImpl<PinyinFuzzyFlags>(
         pinyinView, profile ? profile->pinyinMap() : getPinyinMapV2(), flags,
         identity);

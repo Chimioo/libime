@@ -27,7 +27,7 @@ struct KeyPos {
     float y;
 };
 
-std::unordered_map<char, KeyPos> qwertyKeyPositions() {
+std::unordered_map<char, KeyPos> qwertyKeyPositions(float row2Offset = 1.0F) {
     std::unordered_map<char, KeyPos> pos;
     const std::string row0 = "qwertyuiop";
     const std::string row1 = "asdfghjkl";
@@ -39,7 +39,7 @@ std::unordered_map<char, KeyPos> qwertyKeyPositions() {
         pos[row1[i]] = {static_cast<float>(i) + 0.5F, 1.0F};
     }
     for (size_t i = 0; i < row2.size(); i++) {
-        pos[row2[i]] = {static_cast<float>(i) + 1.0F, 2.0F};
+        pos[row2[i]] = {static_cast<float>(i) + row2Offset, 2.0F};
     }
     return pos;
 }
@@ -53,7 +53,8 @@ using WeightedNeighborMap =
 // get a medium penalty. This covers vertical and diagonal slips that the
 // old same-row-only mapping missed.
 WeightedNeighborMap smartQwertyNeighbors() {
-    auto pos = qwertyKeyPositions();
+    // Match mobile 9-key row1 + Caps-padded 7-key row2 geometry (1.5F offset).
+    auto pos = qwertyKeyPositions(1.5F);
     WeightedNeighborMap result;
     for (const auto &[c1, p1] : pos) {
         for (const auto &[c2, p2] : pos) {
@@ -62,10 +63,13 @@ WeightedNeighborMap smartQwertyNeighbors() {
             }
             float dx = p1.x - p2.x;
             float dy = p1.y - p2.y;
+            if (std::abs(dy) > 1.01F) {
+                continue;
+            }
             float dist = std::sqrt(dx * dx + dy * dy);
-            if (dist <= 1.30F) {
+            if (dist <= 1.15F) {
                 result[c1].emplace_back(c2, NeighborTier::Close);
-            } else if (dist <= 2.05F) {
+            } else if (dist <= 1.50F) {
                 result[c1].emplace_back(c2, NeighborTier::Far);
             }
         }
@@ -100,6 +104,8 @@ getProfileMapping(BuiltinPinyinCorrectionProfile profile) {
     switch (profile) {
     case BuiltinPinyinCorrectionProfile::Qwerty:
         return mappingFromRows({"qwertyuiop", "asdfghjkl", "zxcvbnm"});
+    case BuiltinPinyinCorrectionProfile::SmartQwerty:
+        break;
     }
 
     return {};
@@ -186,69 +192,80 @@ PinyinCorrectionProfile::PinyinCorrectionProfile(
     std::vector<PinyinEntry> baseEntries;
     baseEntries.reserve(d->pinyinMap_.size());
     for (const auto &item : d->pinyinMap_) {
+        // Avoid compounding existing typo/partial variants with SmartCorrection.
+        if (item.flags().test(PinyinFuzzyFlag::CommonTypo) ||
+            item.flags().test(PinyinFuzzyFlag::AdvancedTypo) ||
+            item.flags().test(PinyinFuzzyFlag::PartialFinal)) {
+            continue;
+        }
         baseEntries.push_back(item);
     }
-    for (const auto &item : baseEntries) {
-        const auto &syllable = item.pinyin();
-        // Single-error.
-        for (size_t i = 0; i < syllable.size(); i++) {
-            auto chr = syllable[i];
-            auto it = weighted.find(chr);
-            if (it == weighted.end()) {
-                continue;
-            }
-            auto typo = syllable;
-            for (const auto &[sub, tier] : it->second) {
-                typo[i] = sub;
-                auto flag = (tier == NeighborTier::Close)
-                                ? PinyinFuzzyFlag::SmartCorrection
-                                : PinyinFuzzyFlag::SmartCorrectionFar;
-                dedupInsert(typo, item.initial(), item.final(),
-                            item.flags() | flag);
-                typo[i] = chr;
-            }
-        }
-        // Double-error expansion is disabled: single-error covers adjacent
-        // slips while doubles increase false positives and map size.
-#if 0
-        // Double-error, close-close only, marked as Far. Limited to close
-        // pairs to bound size.
-        if (syllable.size() >= 3) {
+
+    auto insertSubstitutions = [&](NeighborTier targetTier,
+                                   PinyinFuzzyFlag flag) {
+        for (const auto &item : baseEntries) {
+            const auto &syllable = item.pinyin();
             for (size_t i = 0; i < syllable.size(); i++) {
-                auto itI = weighted.find(syllable[i]);
-                if (itI == weighted.end()) {
+                auto chr = syllable[i];
+                auto it = weighted.find(chr);
+                if (it == weighted.end()) {
                     continue;
                 }
-                for (size_t j = i + 1; j < syllable.size(); j++) {
-                    auto itJ = weighted.find(syllable[j]);
-                    if (itJ == weighted.end()) {
+                auto typo = syllable;
+                for (const auto &[sub, tier] : it->second) {
+                    if (tier != targetTier) {
                         continue;
                     }
-                    auto typo = syllable;
-                    auto origI = typo[i];
-                    auto origJ = typo[j];
-                    for (const auto &[subI, tierI] : itI->second) {
-                        if (tierI != NeighborTier::Close) {
-                            continue;
-                        }
-                        for (const auto &[subJ, tierJ] : itJ->second) {
-                            if (tierJ != NeighborTier::Close) {
-                                continue;
-                            }
-                            typo[i] = subI;
-                            typo[j] = subJ;
-                            dedupInsert(typo, item.initial(), item.final(),
-                                        item.flags() |
-                                            PinyinFuzzyFlag::SmartCorrectionFar);
-                        }
-                    }
-                    typo[i] = origI;
-                    typo[j] = origJ;
+                    typo[i] = sub;
+                    dedupInsert(typo, item.initial(), item.final(),
+                                item.flags() | flag);
+                    typo[i] = chr;
                 }
             }
         }
-#endif
+    };
+
+    // Insert lower-penalty variants first so dedupInsert retains best match.
+    insertSubstitutions(NeighborTier::Close, PinyinFuzzyFlag::SmartCorrection);
+
+    for (const auto &item : baseEntries) {
+        const auto &syllable = item.pinyin();
+        // Cover ui -> iu transposition omitted from AdvancedTypo.
+        for (size_t i = 0; i + 1 < syllable.size(); i++) {
+            if (syllable[i] == 'u' && syllable[i + 1] == 'i') {
+                auto typo = syllable;
+                std::swap(typo[i], typo[i + 1]);
+                dedupInsert(typo, item.initial(), item.final(),
+                            item.flags() | PinyinFuzzyFlag::SmartCorrection);
+            }
+        }
     }
+
+    for (const auto &item : baseEntries) {
+        const auto &syllable = item.pinyin();
+        // Absorb accidental double-taps; chars valid across boundaries get Far.
+        for (size_t i = 0; i < syllable.size(); i++) {
+            const char chr = syllable[i];
+            if (i > 0 && chr == syllable[i - 1]) {
+                continue;
+            }
+            const bool canCrossBoundary =
+                (chr == 'a' || chr == 'e' || chr == 'o' || chr == 'n' ||
+                 chr == 'g' || chr == 'r');
+            const auto flag = canCrossBoundary
+                                  ? PinyinFuzzyFlag::SmartCorrectionFar
+                                  : PinyinFuzzyFlag::SmartCorrection;
+            std::string typo;
+            typo.reserve(syllable.size() + 1);
+            typo.append(syllable, 0, i + 1);
+            typo.push_back(chr);
+            typo.append(syllable, i + 1, std::string::npos);
+            dedupInsert(typo, item.initial(), item.final(),
+                        item.flags() | flag);
+        }
+    }
+
+    insertSubstitutions(NeighborTier::Far, PinyinFuzzyFlag::SmartCorrectionFar);
     for (const auto &newEntry : newEntries) {
         d->pinyinMap_.insert(newEntry);
     }

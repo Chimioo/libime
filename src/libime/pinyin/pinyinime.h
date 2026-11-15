@@ -7,13 +7,17 @@
 #define _FCITX_LIBIME_PINYIN_PINYINIME_H_
 
 #include <cstddef>
+#include <istream>
 #include <limits>
 #include <memory>
+#include <ostream>
+#include <string_view>
 #include <fcitx-utils/connectableobject.h>
 #include <fcitx-utils/macros.h>
 #include <libime/pinyin/libimepinyin_export.h>
 #include <libime/pinyin/pinyincorrectionprofile.h>
 #include <libime/pinyin/pinyinencoder.h>
+#include <libime/pinyin/pinyinpersonalprofile.h>
 
 namespace libime {
 
@@ -67,6 +71,20 @@ public:
     void setCorrectionProfile(
         std::shared_ptr<const PinyinCorrectionProfile> profile);
     std::shared_ptr<const PinyinCorrectionProfile> correctionProfile() const;
+
+    void setAdaptiveCorrectionLearning(bool enabled);
+    bool adaptiveCorrectionLearning() const;
+    void setAdaptiveCandidateLearning(bool enabled);
+    bool adaptiveCandidateLearning() const;
+    void setAdaptiveBackspaceLearning(bool enabled);
+    bool adaptiveBackspaceLearning() const;
+
+    PinyinPersonalProfile &personalProfile();
+    const PinyinPersonalProfile &personalProfile() const;
+    void loadPersonalProfile(std::istream &in);
+    void savePersonalProfile(std::ostream &out) const;
+    void clearPersonalProfile();
+    void forgetPersonalWord(std::string_view word);
 
     float maxDistance() const;
     float minPath() const;

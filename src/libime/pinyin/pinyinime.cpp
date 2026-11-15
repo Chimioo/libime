@@ -57,6 +57,10 @@ public:
     float maxDistance_ = std::numeric_limits<float>::max();
     float minPath_ = -std::numeric_limits<float>::max();
     PinyinPreeditMode preeditMode_ = PinyinPreeditMode::RawText;
+    bool adaptiveCorrectionLearning_ = true;
+    bool adaptiveCandidateLearning_ = true;
+    bool adaptiveBackspaceLearning_ = true;
+    PinyinPersonalProfile personalProfile_;
 };
 
 PinyinIME::PinyinIME(std::unique_ptr<PinyinDictionary> dict,
@@ -226,6 +230,75 @@ std::shared_ptr<const PinyinCorrectionProfile>
 PinyinIME::correctionProfile() const {
     FCITX_D();
     return d->correctionProfile_;
+}
+
+void PinyinIME::setAdaptiveCorrectionLearning(bool enabled) {
+    FCITX_D();
+    if (d->adaptiveCorrectionLearning_ != enabled) {
+        d->adaptiveCorrectionLearning_ = enabled;
+        emit<PinyinIME::optionChanged>();
+    }
+}
+
+bool PinyinIME::adaptiveCorrectionLearning() const {
+    FCITX_D();
+    return d->adaptiveCorrectionLearning_;
+}
+
+void PinyinIME::setAdaptiveCandidateLearning(bool enabled) {
+    FCITX_D();
+    if (d->adaptiveCandidateLearning_ != enabled) {
+        d->adaptiveCandidateLearning_ = enabled;
+        emit<PinyinIME::optionChanged>();
+    }
+}
+
+bool PinyinIME::adaptiveCandidateLearning() const {
+    FCITX_D();
+    return d->adaptiveCandidateLearning_;
+}
+
+void PinyinIME::setAdaptiveBackspaceLearning(bool enabled) {
+    FCITX_D();
+    if (d->adaptiveBackspaceLearning_ != enabled) {
+        d->adaptiveBackspaceLearning_ = enabled;
+        emit<PinyinIME::optionChanged>();
+    }
+}
+
+bool PinyinIME::adaptiveBackspaceLearning() const {
+    FCITX_D();
+    return d->adaptiveBackspaceLearning_;
+}
+
+PinyinPersonalProfile &PinyinIME::personalProfile() {
+    FCITX_D();
+    return d->personalProfile_;
+}
+
+const PinyinPersonalProfile &PinyinIME::personalProfile() const {
+    FCITX_D();
+    return d->personalProfile_;
+}
+
+void PinyinIME::loadPersonalProfile(std::istream &in) {
+    FCITX_D();
+    d->personalProfile_.load(in);
+}
+
+void PinyinIME::savePersonalProfile(std::ostream &out) const {
+    FCITX_D();
+    d->personalProfile_.save(out);
+}
+
+void PinyinIME::clearPersonalProfile() {
+    FCITX_D();
+    d->personalProfile_.clear();
+}
+
+void PinyinIME::forgetPersonalWord(std::string_view word) {
+    FCITX_D();
+    d->personalProfile_.forgetWord(word);
 }
 
 } // namespace libime

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <iterator>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <fcitx-utils/log.h>
 #include "libime/core/historybigram.h"
@@ -106,6 +107,112 @@ void testHistory(PinyinIME &ime) {
     FCITX_ASSERT(kuaiIndexNew == kuaiIndex);
 }
 
+void testSmartQwertyAndPersonalLearning(PinyinIME &ime) {
+    ime.clearPersonalProfile();
+    ime.setCorrectionProfile(std::make_shared<PinyinCorrectionProfile>(
+        BuiltinPinyinCorrectionProfile::SmartQwerty));
+    ime.setFuzzyFlags({
+        PinyinFuzzyFlag::VE_UE,
+        PinyinFuzzyFlag::CommonTypo,
+        PinyinFuzzyFlag::AdvancedTypo,
+        PinyinFuzzyFlag::Inner,
+        PinyinFuzzyFlag::Correction,
+        PinyinFuzzyFlag::SmartCorrection,
+        PinyinFuzzyFlag::SmartCorrectionFar,
+    });
+
+    // Double-tap, ui->iu swap, and mobile row2 alignment.
+    {
+        PinyinContext c(&ime);
+        c.type("niihao");
+        FCITX_ASSERT(!c.candidates().empty());
+        FCITX_ASSERT(c.candidates()[0].toString() == "你好");
+    }
+    {
+        PinyinContext c(&ime);
+        c.type("shiu");
+        FCITX_ASSERT(!c.candidates().empty());
+        FCITX_ASSERT(c.candidates()[0].toString() == "水");
+    }
+    // Single-syllable exact protection keeps "否" above "都".
+    {
+        PinyinContext c(&ime);
+        c.type("fou");
+        FCITX_ASSERT(!c.candidates().empty());
+        FCITX_ASSERT(c.candidates()[0].toString() == "否");
+    }
+
+    // Personalized learning: selecting non-top-1 candidate promotes it on retry,
+    // cancel() does not pollute, forget/clear/switches work cleanly.
+    ime.setAdaptiveCorrectionLearning(true);
+    ime.setAdaptiveCandidateLearning(true);
+    {
+        PinyinContext c(&ime);
+        c.type("zhudao");
+        FCITX_ASSERT(c.candidates().size() >= 2);
+        const size_t zhiIdx = candidateIndex(c, "知道");
+        FCITX_ASSERT(zhiIdx < c.candidates().size());
+        c.select(zhiIdx);
+        c.cancel(); // Must roll back pending observation cleanly.
+        c.clear();
+        FCITX_ASSERT(ime.personalProfile().opCount() == 0);
+        FCITX_ASSERT(ime.personalProfile().candidatePrefCount() == 0);
+    }
+    {
+        PinyinContext c(&ime);
+        c.type("zhudao");
+        const size_t zhiIdx = candidateIndex(c, "知道");
+        c.select(zhiIdx);
+        FCITX_ASSERT(c.selected());
+        c.learn();
+    }
+    FCITX_ASSERT(ime.personalProfile().opCount() > 0);
+    FCITX_ASSERT(ime.personalProfile().candidatePrefCount() > 0);
+    {
+        PinyinContext c(&ime);
+        c.type("zhudao");
+        FCITX_ASSERT(!c.candidates().empty());
+        FCITX_ASSERT(c.candidates()[0].toString() == "知道");
+    }
+    // Roundtrip serialization + forget + toggle off.
+    std::stringstream ss;
+    ime.savePersonalProfile(ss);
+    ime.clearPersonalProfile();
+    FCITX_ASSERT(ime.personalProfile().candidatePrefCount() == 0);
+    ss.seekg(0);
+    ime.loadPersonalProfile(ss);
+    FCITX_ASSERT(ime.personalProfile().candidatePrefCount() > 0);
+
+    ime.setAdaptiveCandidateLearning(false);
+    ime.setAdaptiveCorrectionLearning(false);
+    {
+        PinyinContext c(&ime);
+        c.type("zhudao");
+        FCITX_ASSERT(!c.candidates().empty());
+        FCITX_ASSERT(c.candidates()[0].toString() == "主导");
+    }
+    ime.forgetPersonalWord("知道");
+    ime.setAdaptiveCandidateLearning(true);
+    ime.setAdaptiveCorrectionLearning(true);
+
+    // Backspace similarity learning: low-similarity change of mind is ignored;
+    // high-similarity typo correction before backspace is learned & obeys switch.
+    ime.setAdaptiveBackspaceLearning(true);
+    {
+        PinyinContext c(&ime);
+        c.type("pingguo");
+        while (!c.empty()) {
+            c.backspace();
+        }
+        c.type("xiangjiao");
+        if (!c.candidates().empty()) {
+            c.select(0);
+            c.learn();
+        }
+    }
+    FCITX_ASSERT(ime.personalProfile().backtrackCount() == 0);
+}
+
 } // namespace
 
 int main() {
@@ -126,6 +233,7 @@ int main() {
     testPinyin(ime);
     testShuangpin(ime);
     testHistory(ime);
+    testSmartQwertyAndPersonalLearning(ime);
 
     return 0;
 }

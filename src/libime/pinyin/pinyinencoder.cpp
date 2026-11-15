@@ -159,8 +159,13 @@ LongestMatchResult longestMatch(Iter iter, Iter end, PinyinFuzzyFlags flags,
                 .match = std::string_view(&*iter, std::distance(iter, end)),
                 .isCompletePinyin = false};
     }
-    if (std::distance(iter, end) > maxPinyinLength) {
-        end = iter + maxPinyinLength;
+    const int effectiveMaxLen =
+        flags.testAny(PinyinFuzzyFlags{PinyinFuzzyFlag::SmartCorrection,
+                                       PinyinFuzzyFlag::SmartCorrectionFar})
+            ? 7
+            : maxPinyinLength;
+    if (std::distance(iter, end) > effectiveMaxLen) {
+        end = iter + effectiveMaxLen;
     }
     auto range = std::string_view(&*iter, std::distance(iter, end));
     for (; !range.empty(); range.remove_suffix(1)) {
@@ -353,6 +358,56 @@ PinyinEncoder::parseUserPinyin(std::string userPinyin,
                                     q.push(top + innerSeg.first.size());
                                 } else {
                                     result.addNext(top + innerSeg.first.size(),
+                                                   top + nextSize[i]);
+                                }
+                            }
+                        } else if (fuzzyFlags.testAny(PinyinFuzzyFlags{
+                                       PinyinFuzzyFlag::SmartCorrection,
+                                       PinyinFuzzyFlag::SmartCorrectionFar})) {
+                            const PinyinFuzzyFlags excluded{
+                                PinyinFuzzyFlag::CommonTypo,
+                                PinyinFuzzyFlag::AdvancedTypo,
+                                PinyinFuzzyFlag::PartialFinal,
+                                PinyinFuzzyFlag::Correction,
+                                PinyinFuzzyFlag::SmartCorrection,
+                                PinyinFuzzyFlag::SmartCorrectionFar};
+                            for (size_t splitLen : {size_t{2}, size_t{3}}) {
+                                if (splitLen + 2 > nextPinyin.size()) {
+                                    continue;
+                                }
+                                auto prefix = nextPinyin.substr(0, splitLen);
+                                auto suffix = nextPinyin.substr(splitLen);
+                                if (suffix == "m" || suffix == "n" ||
+                                    suffix == "r") {
+                                    continue;
+                                }
+                                auto pRange = pinyinMap.equal_range(prefix);
+                                bool prefixExact = false;
+                                for (const auto &item : std::ranges::subrange(
+                                         pRange.first, pRange.second)) {
+                                    if (flags.test(item.flags()) &&
+                                        !item.flags().testAny(excluded)) {
+                                        prefixExact = true;
+                                        break;
+                                    }
+                                }
+                                if (!prefixExact) {
+                                    continue;
+                                }
+                                auto sRange = pinyinMap.equal_range(suffix);
+                                bool suffixZeroInitial = false;
+                                for (const auto &item : std::ranges::subrange(
+                                         sRange.first, sRange.second)) {
+                                    if (fuzzyFlags.test(item.flags()) &&
+                                        item.initial() ==
+                                            PinyinInitial::Zero) {
+                                        suffixZeroInitial = true;
+                                        break;
+                                    }
+                                }
+                                if (suffixZeroInitial) {
+                                    result.addNext(top, top + splitLen);
+                                    result.addNext(top + splitLen,
                                                    top + nextSize[i]);
                                 }
                             }
@@ -755,11 +810,38 @@ void getFuzzy(FuzzyPinyinSyllables<FuzzyValue> &syls, PinyinSyllable syl,
                     iter = std::prev(syls.end());
                 }
                 auto &finals = iter->second;
-                if (std::find_if(finals.begin(), finals.end(),
-                                 [final](auto &p) {
-                                     return p.first == final;
-                                 }) == finals.end()) {
-                    finals.emplace_back(final, adjuster(flags));
+                auto newFlags = adjuster(flags);
+                auto found = std::find_if(
+                    finals.begin(), finals.end(),
+                    [final](auto &p) { return p.first == final; });
+                if (found == finals.end()) {
+                    finals.emplace_back(final, newFlags);
+                } else if constexpr (std::is_same_v<decltype(newFlags),
+                                                    PinyinFuzzyFlags>) {
+                    auto flagRank = [](PinyinFuzzyFlags f) -> int {
+                        int r = 0;
+                        if (f.test(PinyinFuzzyFlag::Correction)) {
+                            r += 10;
+                        }
+                        if (f.test(PinyinFuzzyFlag::SmartCorrection)) {
+                            r += 6;
+                        }
+                        if (f.test(PinyinFuzzyFlag::SmartCorrectionFar)) {
+                            r += 9;
+                        }
+                        if (f.test(PinyinFuzzyFlag::AdvancedTypo)) {
+                            r += 5;
+                        }
+                        if (f.testAny(PinyinFuzzyFlags{
+                                PinyinFuzzyFlag::CommonTypo,
+                                PinyinFuzzyFlag::PartialFinal})) {
+                            r += 1;
+                        }
+                        return r;
+                    };
+                    if (flagRank(newFlags) < flagRank(found->second)) {
+                        found->second = newFlags;
+                    }
                 }
             }
         }

@@ -41,8 +41,64 @@
 #include "pinyinencoder.h"
 #include "pinyinime.h"
 #include "pinyinmatchstate.h"
+#include "pinyinpersonalprofile.h"
 
 namespace libime {
+
+namespace {
+
+std::vector<PinyinCorrectionOp>
+extractSentenceOps(const SegmentGraph &segs, const SentenceResult &cand) {
+    std::vector<PinyinCorrectionOp> ops;
+    for (const auto *node : cand.sentence()) {
+        const auto &pNode = node->as<PinyinLatticeNode>();
+        if (!pNode.isCorrection()) {
+            continue;
+        }
+        const auto &path = node->path();
+        const auto &encoded = pNode.encodedPinyin();
+        if (path.size() < 2 || (path.size() - 1) * 2 != encoded.size()) {
+            continue;
+        }
+        for (size_t k = 0; k + 1 < path.size(); k++) {
+            auto rawSyl = segs.segment(path[k]->index(), path[k + 1]->index());
+            auto targetSyl =
+                PinyinEncoder::decodeFullPinyin(&encoded[k * 2], 2);
+            if (auto op = extractCorrectionOp(rawSyl, targetSyl)) {
+                ops.push_back(*op);
+            }
+        }
+    }
+    return ops;
+}
+
+std::string_view candidateRawSegment(const SegmentGraph &segs,
+                                     const SentenceResult &cand) {
+    if (cand.sentence().empty()) {
+        return {};
+    }
+    const size_t startIdx = cand.sentence().front()->from()->index();
+    const size_t endIdx = cand.sentence().back()->to()->index();
+    if (endIdx <= startIdx || endIdx > segs.size()) {
+        return {};
+    }
+    return segs.segment(startIdx, endIdx);
+}
+
+bool isFullSpanSingleSyllableExact(const SegmentGraphNode *bos, size_t fullEnd,
+                                   const SentenceResult &cand) {
+    if (cand.sentence().size() != 1) {
+        return false;
+    }
+    const auto *node = cand.sentence().front();
+    if (node->from() != bos || node->to()->index() != fullEnd) {
+        return false;
+    }
+    const auto &pNode = node->as<PinyinLatticeNode>();
+    return !pNode.isCorrection() && pNode.encodedPinyin().size() == 2;
+}
+
+} // namespace
 
 namespace {
 enum class LearnWordResult {
@@ -166,6 +222,21 @@ public:
     mutable std::unordered_set<std::string> candidatesToCursorSet_;
     std::vector<fcitx::ScopedConnection> conn_;
     std::list<PinyinWordNode> contextWords_;
+
+    struct PendingPersonalObs {
+        std::vector<PinyinCorrectionOp> confirmedOps;
+        std::vector<PinyinCorrectionOp> rejectedOps;
+        std::string rawInput;
+        std::string targetPinyin;
+        std::string chosenWord;
+        std::string skippedTopWord;
+        std::string skippedTopPinyin;
+        bool wasCorrection = false;
+    };
+    std::vector<PendingPersonalObs> pendingObs_;
+    std::string backtrackPeakRaw_;
+    size_t backtrackStartOffset_ = 0;
+    bool backtracking_ = false;
 
     size_t alignCursorToNextSegment() const {
         FCITX_Q();
@@ -296,6 +367,31 @@ public:
 
     void select(const SentenceResult &sentence) {
         FCITX_Q();
+        PendingPersonalObs obs;
+        const bool collectCorr = ime_->adaptiveCorrectionLearning() && !sp_;
+        const bool collectCand = ime_->adaptiveCandidateLearning();
+        if ((collectCorr || collectCand) && !sentence.sentence().empty()) {
+            obs.chosenWord = sentence.toString();
+            obs.rawInput = std::string(candidateRawSegment(segs_, sentence));
+            obs.targetPinyin = q->candidateFullPinyin(sentence);
+            obs.wasCorrection = hasCorrection(sentence);
+            if (collectCorr && obs.wasCorrection) {
+                obs.confirmedOps = extractSentenceOps(segs_, sentence);
+            }
+            if (!candidates_.empty()) {
+                const auto &topCand = candidates_.front();
+                auto topWord = topCand.toString();
+                if (topWord != obs.chosenWord) {
+                    obs.skippedTopWord = std::move(topWord);
+                    obs.skippedTopPinyin = q->candidateFullPinyin(topCand);
+                    if (collectCorr && !obs.wasCorrection &&
+                        hasCorrection(topCand)) {
+                        obs.rejectedOps = extractSentenceOps(segs_, topCand);
+                    }
+                }
+            }
+        }
+        pendingObs_.push_back(std::move(obs));
         auto offset = q->selectedLength();
         selectHelper([offset, &sentence,
                       this](std::vector<SelectedPinyin> &selection) {
@@ -314,6 +410,7 @@ public:
     void selectCustom(size_t inputLength, std::string_view segment,
                       std::string_view encodedPinyin) {
         FCITX_Q();
+        pendingObs_.emplace_back();
         auto offset = q->selectedLength();
         selectHelper([this, offset, &segment, inputLength,
                       &encodedPinyin](std::vector<SelectedPinyin> &selection) {
@@ -489,11 +586,32 @@ void PinyinContext::erase(size_t from, size_t to) {
         return;
     }
 
+    FCITX_D();
+    const size_t curSelLen = selectedLength();
+    const size_t totalLen = size();
+    const bool isExplicitClearAll =
+        (from == 0 && to >= totalLen &&
+         ((to - from) > 1 || !d->selected_.empty()));
+
+    if (isExplicitClearAll) {
+        d->backtrackPeakRaw_.clear();
+        d->backtrackStartOffset_ = 0;
+        d->backtracking_ = false;
+    } else if (!d->sp_ && from >= curSelLen && totalLen > curSelLen) {
+        auto unselected = std::string_view(userInput()).substr(curSelLen);
+        if (!d->backtracking_ || curSelLen != d->backtrackStartOffset_ ||
+            unselected.size() > d->backtrackPeakRaw_.size()) {
+            d->backtrackPeakRaw_.assign(unselected);
+            d->backtrackStartOffset_ = curSelLen;
+        }
+        d->backtracking_ = true;
+    }
+
     // check if erase everything
     if (from == 0 && to >= size()) {
-        FCITX_D();
         d->clearCandidates();
         d->selected_.clear();
+        d->pendingObs_.clear();
         d->lattice_.clear();
         d->matchState_.clear();
         d->segs_ = SegmentGraph();
@@ -636,6 +754,14 @@ void PinyinContext::cancel() {
     FCITX_D();
     if (!d->selected_.empty()) {
         d->selected_.pop_back();
+        if (d->pendingObs_.size() > d->selected_.size()) {
+            d->pendingObs_.pop_back();
+        }
+        if (selectedLength() < d->backtrackStartOffset_) {
+            d->backtrackPeakRaw_.clear();
+            d->backtrackStartOffset_ = 0;
+            d->backtracking_ = false;
+        }
 
         // There is no point to reuse any existing matching state.
         // For example, cancel from (tao zi) tao zi to  tao zi tao zi.
@@ -715,9 +841,17 @@ void PinyinContext::update() {
 
         const auto *bos = &graph.start();
 
+        const bool useCorrLearn =
+            d->ime_->adaptiveCorrectionLearning() && !d->sp_;
+        const bool useCandLearn = d->ime_->adaptiveCandidateLearning();
+        const bool useBacktrackLearn =
+            d->ime_->adaptiveBackspaceLearning() && !d->sp_;
+        const auto &personal = d->ime_->personalProfile();
+
         auto beginSize = d->candidates_.size();
         for (size_t i = graph.size(); i > 0; i--) {
-            float min = 0;
+            bool hasExactWord = false;
+            float min = std::numeric_limits<float>::max();
             float max = -std::numeric_limits<float>::max();
             auto distancePenalty = d->ime_->model()->unknownPenalty() /
                                    PINYIN_DISTANCE_PENALTY_FACTOR;
@@ -733,6 +867,7 @@ void PinyinContext::update() {
                         !static_cast<const PinyinLatticeNode &>(latticeNode)
                              .isCorrection()) {
                         if (!d->ime_->model()->isNodeUnknown(latticeNode)) {
+                            hasExactWord = true;
                             min = std::min(latticeNode.score(), min);
                             max = std::max(latticeNode.score(), max);
                         }
@@ -746,16 +881,20 @@ void PinyinContext::update() {
             for (const auto &graphNode : graph.nodes(i)) {
                 auto distance = graph.distanceToEnd(graphNode);
                 auto adjust = static_cast<float>(distance) * distancePenalty;
+                const auto spanRaw = graph.segment(0, i);
                 for (const auto &latticeNode : d->lattice_.nodes(&graphNode)) {
-                    if (latticeNode.from() == bos &&
-                        static_cast<const PinyinLatticeNode &>(latticeNode)
-                            .isCorrection()) {
-                        if ((latticeNode.score() > min &&
+                    const auto &pyNode =
+                        static_cast<const PinyinLatticeNode &>(latticeNode);
+                    if (latticeNode.from() == bos && pyNode.isCorrection()) {
+                        const bool backtrackRescued =
+                            useBacktrackLearn && i == graph.size() &&
+                            personal.backtrackMatchStrength(
+                                spanRaw, latticeNode.word()) >= 0.4F;
+                        if (!hasExactWord || backtrackRescued ||
+                            (latticeNode.score() > min &&
                              latticeNode.score() + d->ime_->maxDistance() >
                                  max) ||
-                            static_cast<const PinyinLatticeNode &>(latticeNode)
-                                    .encodedPinyin()
-                                    .size() <= 2) {
+                            pyNode.encodedPinyin().size() <= 2) {
                             d->candidates_.push_back(
                                 latticeNode.toSentenceResult(adjust));
                         }
@@ -777,6 +916,33 @@ void PinyinContext::update() {
                             latticeNode.toSentenceResult(adjust));
                     }
                 }
+            }
+        }
+        if (useCorrLearn || useCandLearn || useBacktrackLearn) {
+            for (auto &cand : d->candidates_) {
+                float delta = 0.0F;
+                const auto rawSeg = candidateRawSegment(graph, cand);
+                const auto fullPy = candidateFullPinyin(cand);
+                if (useCorrLearn && hasCorrection(cand)) {
+                    delta += personal.scoreCorrectionOps(
+                        extractSentenceOps(graph, cand));
+                }
+                if (useCandLearn) {
+                    delta += personal.scoreCandidate(rawSeg, fullPy,
+                                                     cand.toString());
+                }
+                if (useBacktrackLearn) {
+                    delta += personal.scoreBacktrackMatch(rawSeg, fullPy,
+                                                          cand.toString());
+                }
+                if (delta != 0.0F) {
+                    cand.adjustScore(delta);
+                }
+            }
+            if (beginSize > 1) {
+                std::stable_sort(d->candidates_.begin(),
+                                 d->candidates_.begin() + beginSize,
+                                 std::greater<>());
             }
         }
         std::sort(d->candidates_.begin() + beginSize, d->candidates_.end(),
@@ -829,6 +995,69 @@ void PinyinContext::update() {
                     duplicateByRange.insert(std::move(byRange));
                     return false;
                 });
+
+            // Protect exact full-span single-syllable inputs from being
+            // hijacked at Top-1 by higher-frequency correction neighbors.
+            const size_t fullEnd = graph.size();
+            if (!d->candidates_.empty() &&
+                hasCorrection(d->candidates_.front())) {
+                size_t promoted = 0;
+                constexpr size_t kMaxPromotedExact = 3;
+                for (size_t idx = 0;
+                     idx < d->candidates_.size() &&
+                     promoted < kMaxPromotedExact;
+                     ++idx) {
+                    if (isFullSpanSingleSyllableExact(bos, fullEnd,
+                                                      d->candidates_[idx])) {
+                        std::rotate(d->candidates_.begin() + promoted,
+                                    d->candidates_.begin() + idx,
+                                    d->candidates_.begin() + idx + 1);
+                        ++promoted;
+                    }
+                }
+            }
+
+            // Promote full-span candidates that the user explicitly preferred
+            // or corrected via backspacing for this exact raw input.
+            if ((useCandLearn || useBacktrackLearn) &&
+                d->candidates_.size() > 1 && fullEnd > 0) {
+                const auto fullRaw = graph.segment(0, fullEnd);
+                const bool topIsProtectedExact =
+                    isFullSpanSingleSyllableExact(bos, fullEnd,
+                                                  d->candidates_.front());
+                size_t bestIdx = 0;
+                float bestHits = 1.15F;
+                for (size_t idx = 0; idx < d->candidates_.size(); ++idx) {
+                    const auto &cand = d->candidates_[idx];
+                    if (cand.sentence().empty() ||
+                        cand.sentence().front()->from() != bos ||
+                        cand.sentence().back()->to()->index() != fullEnd) {
+                        continue;
+                    }
+                    if (topIsProtectedExact &&
+                        !isFullSpanSingleSyllableExact(bos, fullEnd, cand)) {
+                        continue;
+                    }
+                    float hits = 0.0F;
+                    if (useCandLearn) {
+                        hits = std::max(hits, personal.rawPreferenceHits(
+                                                  fullRaw, cand.toString()));
+                    }
+                    if (useBacktrackLearn) {
+                        hits = std::max(hits, personal.backtrackMatchStrength(
+                                                  fullRaw, cand.toString()));
+                    }
+                    if (hits > bestHits) {
+                        bestHits = hits;
+                        bestIdx = idx;
+                    }
+                }
+                if (bestIdx > 0) {
+                    std::rotate(d->candidates_.begin(),
+                                d->candidates_.begin() + bestIdx,
+                                d->candidates_.begin() + bestIdx + 1);
+                }
+            }
         }
 
         d->candidatesToCursorNeedUpdate_ = true;
@@ -1091,6 +1320,59 @@ void PinyinContext::learn() {
     if (!selected()) {
         return;
     }
+
+    if (!d->pendingObs_.empty()) {
+        const bool learnCorr =
+            d->ime_->adaptiveCorrectionLearning() && !d->sp_;
+        const bool learnCand = d->ime_->adaptiveCandidateLearning();
+        auto &personal = d->ime_->personalProfile();
+        for (const auto &obs : d->pendingObs_) {
+            if (learnCorr) {
+                personal.recordCorrection(obs.confirmedOps, obs.rejectedOps);
+            }
+            if (learnCand) {
+                personal.recordCandidateSelection(
+                    obs.rawInput, obs.targetPinyin, obs.chosenWord,
+                    obs.skippedTopWord, obs.skippedTopPinyin,
+                    obs.wasCorrection);
+            }
+        }
+        d->pendingObs_.clear();
+    }
+
+    if (d->ime_->adaptiveBackspaceLearning() && !d->sp_ &&
+        !d->backtrackPeakRaw_.empty() &&
+        d->backtrackStartOffset_ < userInput().size()) {
+        const auto finalTailRaw =
+            std::string_view(userInput()).substr(d->backtrackStartOffset_);
+        std::string tailWord;
+        std::string tailPinyin;
+        for (const auto &selGroup : d->selected_) {
+            if (selGroup.empty() ||
+                selGroup.back().offset_ <= d->backtrackStartOffset_) {
+                continue;
+            }
+            for (const auto &item : selGroup) {
+                if (item.type_ == SelectedPinyinType::Separator) {
+                    continue;
+                }
+                tailWord += item.word_.word();
+                if (!item.encodedPinyin().empty()) {
+                    if (!tailPinyin.empty()) {
+                        tailPinyin.push_back('\'');
+                    }
+                    tailPinyin +=
+                        PinyinEncoder::decodeFullPinyin(item.encodedPinyin());
+                }
+            }
+        }
+        d->ime_->personalProfile().recordBacktrackCorrection(
+            d->backtrackPeakRaw_, finalTailRaw, tailPinyin, tailWord,
+            d->ime_->adaptiveCorrectionLearning());
+    }
+    d->backtrackPeakRaw_.clear();
+    d->backtrackStartOffset_ = 0;
+    d->backtracking_ = false;
 
     std::vector<HistoryBigram::WordWithCode> newSentence;
     if (auto [result, encodedWordPinyin] = d->learnWord();
